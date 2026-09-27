@@ -1,13 +1,16 @@
 # 高考志愿填报查询平台
 
-核心流程：**查询 → 结果展示 → 推荐**。三个页面，移动端优先，数据先用假数据跑通，
-正式数据通过 Excel/CSV 导入 Cloudflare D1。
+核心流程：**查询 → 结果展示 → 推荐**。三个页面，移动端优先。
+仓库里已经放好一份真实录取数据（浙江 2017–2025，约 20 万条），打开就能查。
 
-> **在线试玩（假数据演示）**：https://niannian01-dol.github.io/gaokao-volunteer/
-> 打开后会自动进入"本地演示模式"，直接用浏览器里的假数据算，不需要后端。
+> **在线体验（真实数据 · 浙江 2017–2025）**：https://niannian01-dol.github.io/gaokao-volunteer/
+> 纯静态站，打开即用，手机浏览器也能玩，不需要后端。
 
-> 当前 `public/data/*.json` 与 `schema/02_seed.sql` 里全部是**占位假数据**，
-> 只用于验证流程，不能用于真实志愿填报。
+> **Cloudflare Workers + D1 版（备用）**：https://gaokao-volunteer.gaokao-niannian.workers.dev
+> 同一套数据跑在 D1 上；部分网络环境证书会被干扰，打不开就用上面那个 GitHub Pages。
+
+> 数据来源：浙江省教育考试院公布的历年普通类平行志愿投档分数线（2017–2025）。
+> 数据仅供参考，正式填报请以省考试院当年公布为准。
 
 ## 快速开始（本地，无需安装任何依赖）
 
@@ -40,10 +43,10 @@ gaokao-platform/
 │  │  ├─ core.js                # 共享核心逻辑：过滤/排序/分页/分数位次换算/冲稳保分档
 │  │  ├─ app.js                 # 页面逻辑 + 接口客户端（含无后端时的本地降级）
 │  │  └─ styles.css             # 移动优先样式
-│  └─ data/                     # 演示数据（假数据）
-│     ├─ admission.json         # 录取记录
+│  └─ data/                     # 前端直接读的数据（真数据按年份懒加载）
+│     ├─ admission-<省>-<年>.json  # 录取记录，如 admission-zhejiang-2025.json
 │     ├─ score-segments.json    # 一分一段表
-│     └─ meta.json              # 筛选器选项
+│     └─ meta.json              # 筛选器选项 + 数据量统计
 ├─ src/worker.js                # Cloudflare Worker：/api/* + 静态资源
 ├─ schema/
 │  ├─ 01_schema.sql             # D1 建表（4 张表 + 索引）
@@ -194,9 +197,10 @@ export const SCORE_RULES = { reachFloor: -20, steadyMax: 12, safetyCeil: 30 };
   node scripts/verify-d1.mjs
   ```
 
-> **数据合规**：仓库里只有脚本生成的假数据。真实的投档线、一分一段数据来自各省教育考试院，
-> 转载和再分发有版权风险，请不要提交进公开仓库；用 `node scripts/csv-to-sql.mjs` 导入到自己的 D1 就行。
-> 生成出来的 `schema/03_import.sql`、`schema/04_segments.sql` 已经在 `.gitignore` 里，避免误提交。
+> **数据合规**：仓库里的 `public/data/*.json` 是浙江省教育考试院公布数据的整理版，仅用于学习交流，
+> 版权归原发布方所有；正式填报请以省考试院公布为准。想换成别的省份，用 `node scripts/csv-to-sql.mjs`
+> 导入自己的数据，再跑 `node scripts/export-static.mjs` 生成静态文件即可。
+> 中间产物 `schema/03_import.sql`、`schema/04_segments.sql` 已经在 `.gitignore` 里，避免误提交。
 
 ---
 

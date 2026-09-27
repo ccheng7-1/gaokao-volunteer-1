@@ -3,13 +3,13 @@
  *
  *   node dev-server.mjs            # http://127.0.0.1:8787
  *   node dev-server.mjs --port 9000
- *   node dev-server.mjs --json     # 忽略本地 D1，强制用 data/*.json 里的假数据
+ *   node dev-server.mjs --json     # 忽略本地 D1，改用 public/data/*.json（打包好的真实数据）
  *   node dev-server.mjs --no-api   # 只托管静态页，验证前端离线降级
  *   node dev-server.mjs --lan      # 绑定所有网卡，同一 Wi-Fi 下的手机可访问
  *
  * /api 接口与线上 Cloudflare Worker 完全一致（同一份 src/worker.js）：
  *   - 本地 D1 里导入过数据（.wrangler/state/v3/d1/*.sqlite）就直接读 D1，页面看到真实数据；
- *   - 没导入过则退回 public/data/*.json 假数据，仍能把「查询 -> 结果 -> 推荐」跑通。
+ *   - 没导入过则退回 public/data/*.json（静态真实数据），仍能把「查询 -> 结果 -> 推荐」跑通。
  */
 
 import { createServer } from "node:http";
@@ -36,10 +36,10 @@ const hostFlag = args.indexOf("--host");
 const HOST = args.includes("--lan") ? "0.0.0.0" : (hostFlag >= 0 ? args[hostFlag + 1] : process.env.HOST || "127.0.0.1");
 /** --no-api：只做静态托管，用来验证"没有后端时前端降级读 data/*.json"这条路径。 */
 const NO_API = args.includes("--no-api");
-/** --json：忽略本地 D1，强制走 public/data/*.json 的假数据。 */
+/** --json：忽略本地 D1，强制走 public/data/*.json（打包好的真实数据）。 */
 const FORCE_JSON = args.includes("--json");
 
-/* 数据源选择：本地 D1 优先，其次假数据 JSON。 */
+/* 数据源选择：本地 D1 优先，其次打包好的静态数据。 */
 const localD1File = NO_API || FORCE_JSON ? null : findLocalD1();
 const DATA_SOURCE = localD1File ? "d1" : "json";
 const d1Handler = localD1File ? createD1(localD1File) : null;
@@ -76,18 +76,62 @@ async function loadJson(name) {
 let statsCache = null;
 async function loadStats() {
   if (statsCache) return statsCache;
-  const [rows, meta] = await Promise.all([loadJson("admission.json"), loadJson("meta.json")]);
+  const meta = await loadJson("meta.json");
   statsCache = {
-    admissionRows: rows.length,
-    universities: new Set(rows.map((r) => r.university_name)).size,
-    majors: new Set(rows.map((r) => r.major_name)).size,
-    provinces: meta.provinces.length,
-    years: meta.years,
-    byProvince: Object.fromEntries(
-      meta.provinces.map((p) => [p, rows.filter((r) => r.province === p).length]),
-    ),
+    ...(meta.stats || {}),
+    provinces: (meta.provinces || []).length,
+    years: meta.years || [],
   };
   return statsCache;
+}
+
+/** 省份 -> 数据文件名前缀（以后加省份在这里加一行）。 */
+const PROVINCE_SLUG = { 浙江: "zhejiang" };
+
+/** 把"字典 + 索引行"的压缩数据还原成普通记录数组。 */
+function expandAdmission(payload) {
+  const subjects = payload.subjects || [];
+  const batches = payload.batches || [];
+  const universities = payload.universities || [];
+  const majors = payload.majors || [];
+  return (payload.rows || []).map((r) => {
+    const u = universities[r[0]] || [];
+    const m = majors[r[1]] || [];
+    const row = {
+      id: r[7],
+      province: payload.province,
+      year: payload.year,
+      subject_category: subjects[r[2]],
+      batch: batches[r[3]],
+      university_code: u[0],
+      university_name: u[1],
+      university_province: u[2],
+      university_city: u[3],
+      university_type: u[4],
+      university_nature: u[5],
+      university_tags: u[6],
+      major_code: m[0],
+      major_name: m[1],
+      major_category: m[2],
+      major_sub_category: m[3],
+      major_degree: m[4],
+      min_score: r[4] === null ? undefined : r[4],
+      min_rank: r[5] === null ? undefined : r[5],
+      plan_count: r[6] === null ? undefined : r[6],
+    };
+    for (const key of Object.keys(row)) if (row[key] === undefined || row[key] === "") delete row[key];
+    return row;
+  });
+}
+
+/** 按省份 + 年份加载录取数据（一年一个文件）。 */
+async function loadAdmission(province, year) {
+  const meta = await loadJson("meta.json");
+  const p = province || meta.provinces?.[0];
+  const y = String(year || meta.years?.[0] || "");
+  const fromMeta = meta.files?.[y]?.replace(/^data\//, "");
+  const file = fromMeta || `admission-${PROVINCE_SLUG[p] || encodeURIComponent(p)}-${y}.json`;
+  return loadJson(file);
 }
 
 /* ------------------------------------------------------------------ */
@@ -118,7 +162,7 @@ async function handleApi(url) {
   }
 
   if (route === "query") {
-    const rows = await loadJson("admission.json");
+    const rows = expandAdmission(await loadAdmission(params.get("province") || undefined, num(params, "year") || undefined));
     const result = queryRows(rows, {
       province: params.get("province") || undefined,
       year: num(params, "year") || undefined,
@@ -131,18 +175,19 @@ async function handleApi(url) {
       page: num(params, "page") || 1,
       pageSize: Math.min(100, num(params, "pageSize") || 20),
     });
-    return { status: 200, body: { source: "demo", ...result } };
+    return { status: 200, body: { source: "static", ...result } };
   }
 
   if (route === "recommend") {
-    const rows = await loadJson("admission.json");
     const segmentTables = await loadJson("score-segments.json");
-    const province = params.get("province") || "江苏";
-    const year = String(num(params, "year") || 2024);
-    const subject = params.get("subject") || "物理类";
+    const meta = await loadJson("meta.json");
+    const province = params.get("province") || meta.provinces?.[0] || "浙江";
+    const year = String(num(params, "year") || meta.years?.[0] || "");
+    const subject = params.get("subject") || meta.subjectsByProvince?.[province]?.[0] || "综合";
     const batch = params.get("batch") || undefined;
     const score = num(params, "score");
     const rank = num(params, "rank");
+    const rows = expandAdmission(await loadAdmission(province, year));
 
     const filtered = filterRows(rows, { province, year, subject, batch });
     const segments = normalizeSegments(segmentTables?.[province]?.[subject]?.[year] || []);
@@ -162,7 +207,7 @@ async function handleApi(url) {
     return {
       status: 200,
       body: {
-        source: "demo",
+        source: "static",
         basis: result.basis,
         input: result.input,
         rules: result.rules,
@@ -273,10 +318,10 @@ server.listen(PORT, HOST, async () => {
       console.log(`  数据源：D1 读取失败 —— ${error?.message || error}`);
     }
   } else if (NO_API) {
-    console.log(`  数据源：纯静态托管（--no-api），页面自己读 data/*.json 假数据`);
+    console.log(`  数据源：纯静态托管（--no-api），页面自己读 data/*.json（打包好的真实数据）`);
   } else {
     const stats = await loadStats();
-    console.log(`  数据源：data/*.json 假数据（本地 D1 还没有数据）`);
+    console.log(`  数据源：public/data/*.json 静态真实数据（本地 D1 还没有数据）`);
     console.log(`  数据量：${stats.admissionRows} 条录取记录 / ${stats.universities} 所院校 / ${stats.majors} 个专业`);
   }
   console.log(`  接口：/api/meta  /api/query  /api/recommend`);

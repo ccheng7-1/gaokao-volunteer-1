@@ -85,13 +85,73 @@ async function loadLocal(name) {
   return localCache[name];
 }
 
+/** 省份 -> 数据文件名前缀（以后加省份在这里加一行即可）。 */
+const PROVINCE_SLUG = { 浙江: "zhejiang" };
+
+const provinceSlug = (province) => PROVINCE_SLUG[province] || encodeURIComponent(province);
+
+/**
+ * 把"字典 + 索引行"的压缩数据还原成普通记录数组。
+ * 每年一个文件，避免一次性拉几十 MB 把手机拖死；生成方式见 scripts/export-static.mjs。
+ */
+function expandAdmission(payload) {
+  const subjects = payload.subjects || [];
+  const batches = payload.batches || [];
+  const universities = payload.universities || [];
+  const majors = payload.majors || [];
+  const rows = payload.rows || [];
+  return rows.map((r) => {
+    const u = universities[r[0]] || [];
+    const m = majors[r[1]] || [];
+    const row = {
+      id: r[7],
+      province: payload.province,
+      year: payload.year,
+      subject_category: subjects[r[2]],
+      batch: batches[r[3]],
+      university_code: u[0],
+      university_name: u[1],
+      university_province: u[2],
+      university_city: u[3],
+      university_type: u[4],
+      university_nature: u[5],
+      university_tags: u[6],
+      major_code: m[0],
+      major_name: m[1],
+      major_category: m[2],
+      major_sub_category: m[3],
+      major_degree: m[4],
+      min_score: r[4] === null ? undefined : r[4],
+      min_rank: r[5] === null ? undefined : r[5],
+      plan_count: r[6] === null ? undefined : r[6],
+    };
+    for (const key of Object.keys(row)) if (row[key] === undefined || row[key] === "") delete row[key];
+    return row;
+  });
+}
+
+/** 按省份 + 年份加载录取数据（一年一个文件）。 */
+async function loadAdmission(province, year) {
+  const meta = await loadLocal("meta.json");
+  const p = province || meta.provinces?.[0];
+  const y = String(year || meta.years?.[0] || "");
+  const file = meta.files?.[y] || `data/admission-${provinceSlug(p)}-${y}.json`;
+  const key = `admission:${file}`;
+  if (!localCache[key]) {
+    const res = await fetch(`./${file}`, { cache: "force-cache" });
+    if (!res.ok) throw new Error(`无法加载 ./${file}`);
+    localCache[key] = expandAdmission(await res.json());
+  }
+  return localCache[key];
+}
+
 function markLocalMode() {
   if (document.body.dataset.mode === "local") return;
   document.body.dataset.mode = "local";
   const notice = $("#mode-notice");
   if (notice) {
     notice.hidden = false;
-    notice.textContent = "本地演示模式：接口不可用，已改用 data/*.json 在浏览器内直接计算。";
+    notice.textContent = "静态数据模式：页面自带数据文件，全部计算在你的浏览器里完成，无需后端。";
   }
 }
 
@@ -109,6 +169,12 @@ function updateDataSourceNote(meta) {
     note.textContent =
       `数据来自 D1 数据库：${formatNumber(stats.admissionRows)} 条录取记录 · ` +
       `${formatNumber(stats.universities)} 所院校 · ${formatNumber(stats.majors)} 个专业（${provinces}）。`;
+  } else if (meta?.dataset === "static") {
+    const provinces = (meta.provinces || []).join("/") || "—";
+    note.textContent =
+      `真实数据：${formatNumber(stats.admissionRows)} 条录取记录 · ` +
+      `${formatNumber(stats.universities)} 所院校 · ${formatNumber(stats.majors)} 个专业（${provinces}）。` +
+      String(meta.warning || "");
   } else if (meta?.warning) {
     note.textContent = String(meta.warning);
   }
@@ -134,16 +200,13 @@ async function apiGet(route, params = {}) {
 
 async function localApi(route, params) {
   if (route === "meta") {
-    const [meta, rows] = await Promise.all([loadLocal("meta.json"), loadLocal("admission.json")]);
-    return {
-      ...meta,
-      stats: { ...(meta.stats || {}), admissionRows: rows.length, universities: new Set(rows.map((r) => r.university_name)).size },
-    };
+    const meta = await loadLocal("meta.json");
+    return { ...meta, stats: { ...(meta.stats || {}) } };
   }
   if (route === "query") {
-    const rows = await loadLocal("admission.json");
+    const rows = await loadAdmission(params.province, params.year);
     return {
-      source: "local",
+      source: "static",
       ...queryRows(rows, {
         ...params,
         year: params.year ? Number(params.year) : undefined,
@@ -153,10 +216,14 @@ async function localApi(route, params) {
     };
   }
   if (route === "recommend") {
-    const [rows, segments] = await Promise.all([loadLocal("admission.json"), loadLocal("score-segments.json")]);
-    const province = params.province || "江苏";
-    const year = String(params.year || rows[0]?.year || 2024);
-    const subject = params.subject || "物理类";
+    const meta = await loadLocal("meta.json");
+    const province = params.province || meta.provinces?.[0];
+    const year = String(params.year || meta.years?.[0] || "");
+    const subject = params.subject || meta.subjectsByProvince?.[province]?.[0] || "";
+    const [rows, segments] = await Promise.all([
+      loadAdmission(province, year),
+      loadLocal("score-segments.json"),
+    ]);
     const result = buildRecommendations({
       rows: filterRows(rows, { province, year, subject, batch: params.batch }),
       userScore: params.score ? Number(params.score) : null,
@@ -164,7 +231,7 @@ async function localApi(route, params) {
       segments: normalizeSegments(segments?.[province]?.[subject]?.[year] || []),
       perBucket: 600,
     });
-    return { source: "local", ...result, buckets: shapeBuckets(result.buckets) };
+    return { source: "static", ...result, buckets: shapeBuckets(result.buckets) };
   }
   throw new Error(`未知接口 ${route}`);
 }
