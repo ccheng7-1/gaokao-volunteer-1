@@ -21,6 +21,7 @@ import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { buildRecommendations, deriveMeta, filterRows, queryRows, normalizeSegments } from "./public/assets/core.js";
+import { runAssistant } from "./public/assets/assistant-core.mjs";
 import { createD1, findLocalD1 } from "./scripts/local-d1.mjs";
 import worker from "./src/worker.js";
 
@@ -222,6 +223,77 @@ async function handleApi(url) {
 }
 
 /* ------------------------------------------------------------------ */
+/* /api/chat（AI 助手）                                                 */
+/* ------------------------------------------------------------------ */
+
+/**
+ * JSON 模式的助手依赖：进程内直接算，形状与 /api/query、/api/recommend 一致。
+ * LLM 配置从环境变量读取（OpenAI 兼容接口，不配则用内置规则引擎）：
+ *   CHAT_API_KEY / CHAT_BASE_URL / CHAT_MODEL
+ */
+async function handleChat(url, rawBody) {
+  let body;
+  try {
+    body = JSON.parse(rawBody || "{}");
+  } catch {
+    return { status: 400, body: { error: "bad_request", message: "请求体必须是 JSON（{ messages: [...] }）" } };
+  }
+
+  const meta = await loadJson("meta.json");
+  const stats = await loadStats();
+
+  const deps = {
+    query: async (args = {}) => {
+      const rows = expandAdmission(await loadAdmission(args.province, args.year));
+      return queryRows(rows, {
+        province: args.province,
+        year: args.year,
+        subject: args.subject,
+        batch: args.batch,
+        university: args.university,
+        major: args.major,
+        keyword: args.keyword,
+        sort: args.sort || "rank",
+        page: args.page || 1,
+        pageSize: Math.min(100, args.pageSize || 20),
+      });
+    },
+    recommend: async (args = {}) => {
+      const segmentTables = await loadJson("score-segments.json");
+      const province = args.province || meta.provinces?.[0] || "浙江";
+      const year = String(args.year || meta.years?.[0] || "");
+      const subject = args.subject || meta.subjectsByProvince?.[province]?.[0] || "综合";
+      const rows = expandAdmission(await loadAdmission(province, year));
+      const segments = normalizeSegments(segmentTables?.[province]?.[subject]?.[year] || []);
+      const result = buildRecommendations({
+        rows: filterRows(rows, { province, year, subject, batch: args.batch }),
+        userScore: args.score,
+        userRank: args.rank,
+        segments,
+        perBucket: 600,
+      });
+      const buckets = {};
+      for (const [key, bucket] of Object.entries(result.buckets)) {
+        const { rows: _rows, ...rest } = bucket;
+        buckets[key] = rest;
+      }
+      return { basis: result.basis, input: result.input, rules: result.rules, buckets };
+    },
+  };
+
+  const llm = process.env.CHAT_API_KEY
+    ? {
+        baseUrl: process.env.CHAT_BASE_URL || "https://api.openai.com/v1",
+        apiKey: process.env.CHAT_API_KEY,
+        model: process.env.CHAT_MODEL || "gpt-4o-mini",
+      }
+    : null;
+
+  const result = await runAssistant({ messages: body.messages, meta: { ...meta, stats: { ...meta.stats, ...stats } }, deps, llm });
+  return { status: 200, body: result };
+}
+
+/* ------------------------------------------------------------------ */
 /* 静态资源                                                            */
 /* ------------------------------------------------------------------ */
 
@@ -250,6 +322,16 @@ async function serveStatic(pathname) {
 /* 服务器                                                              */
 /* ------------------------------------------------------------------ */
 
+/** 读出请求体（Node 流 -> 字符串）。 */
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    req.on("error", reject);
+  });
+}
+
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || "127.0.0.1"}`);
   const started = Date.now();
@@ -258,6 +340,20 @@ const server = createServer(async (req, res) => {
     let result;
     if (NO_API && url.pathname.startsWith("/api/")) {
       result = { status: 404, type: "application/json; charset=utf-8", body: { error: "api_disabled" } };
+    } else if (url.pathname === "/api/chat") {
+      if (req.method !== "POST") {
+        result = { status: 405, body: { error: "method_not_allowed", message: "/api/chat 只支持 POST" } };
+      } else if (DATA_SOURCE === "d1") {
+        /* D1 模式：与其它接口一样直接委托 Worker，保证本地和线上行为一致。 */
+        const response = await worker.fetch(
+          new Request(url.href, { method: "POST", headers: { "content-type": "application/json" }, body: await readBody(req) }),
+          { DB: d1Handler, ASSETS: ASSETS_STUB },
+        );
+        result = { status: response.status, body: await response.json() };
+      } else {
+        result = await handleChat(url, await readBody(req));
+      }
+      result.type = "application/json; charset=utf-8";
     } else if (url.pathname.startsWith("/api/")) {
       result = await handleApi(url);
       result.type = "application/json; charset=utf-8";
@@ -324,5 +420,10 @@ server.listen(PORT, HOST, async () => {
     console.log(`  数据源：public/data/*.json 静态真实数据（本地 D1 还没有数据）`);
     console.log(`  数据量：${stats.admissionRows} 条录取记录 / ${stats.universities} 所院校 / ${stats.majors} 个专业`);
   }
-  console.log(`  接口：/api/meta  /api/query  /api/recommend`);
+  console.log(`  接口：/api/meta  /api/query  /api/recommend  /api/chat（AI 助手）`);
+  console.log(
+    process.env.CHAT_API_KEY
+      ? `  AI 助手：LLM 模式（${process.env.CHAT_MODEL || "gpt-4o-mini"} @ ${process.env.CHAT_BASE_URL || "https://api.openai.com/v1"}）`
+      : `  AI 助手：本地规则模式（配置环境变量 CHAT_API_KEY 可启用大模型问答）`,
+  );
 });

@@ -16,6 +16,7 @@ import {
   scoreRanges,
   scoreToRank,
 } from "../public/assets/core.js";
+import { runAssistant } from "../public/assets/assistant-core.mjs";
 
 /**
  * 查询用的固定子句。
@@ -261,6 +262,54 @@ async function handleRecommend(env, params) {
   };
 }
 
+/* ---------------------------- /api/chat ---------------------------- */
+
+/**
+ * AI 助手：POST { messages: [{role, content}] } -> { reply, engine }。
+ *
+ * LLM 模式需要配置环境变量（wrangler secret put CHAT_API_KEY）：
+ *   CHAT_API_KEY   OpenAI 兼容接口的密钥
+ *   CHAT_BASE_URL  接口地址，默认 https://api.openai.com/v1（DeepSeek/通义/Kimi 均可）
+ *   CHAT_MODEL     模型名，默认 gpt-4o-mini
+ * 没配置时自动降级为内置规则引擎，同样能查库回答常见问题。
+ */
+async function handleChat(request, env) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: "bad_request", message: "请求体必须是 JSON（{ messages: [...] }）" }, 400);
+  }
+
+  const meta = await loadMeta(env);
+  const toParams = (args = {}) => {
+    const params = new URLSearchParams();
+    for (const [key, value] of Object.entries(args)) {
+      if (value !== null && value !== undefined && value !== "") params.set(key, String(value));
+    }
+    return params;
+  };
+
+  const deps = {
+    query: async (args) => handleQuery(env, toParams(args)),
+    recommend: async (args) => {
+      const result = await handleRecommend(env, toParams(args));
+      /* 参数缺失时 handleRecommend 返回 400 Response，这里展开成普通对象。 */
+      return result instanceof Response ? await result.json() : result;
+    },
+  };
+
+  const llm = env.CHAT_API_KEY
+    ? {
+        baseUrl: env.CHAT_BASE_URL || "https://api.openai.com/v1",
+        apiKey: env.CHAT_API_KEY,
+        model: env.CHAT_MODEL || "gpt-4o-mini",
+      }
+    : null;
+
+  return json(await runAssistant({ messages: body.messages, meta, deps, llm }));
+}
+
 /* ------------------------------ 入口 ------------------------------ */
 
 export default {
@@ -277,6 +326,12 @@ export default {
       if (route === "meta") return json(await loadMeta(env));
       if (route === "query") return json(await handleQuery(env, url.searchParams));
       if (route === "recommend") return json(await handleRecommend(env, url.searchParams));
+      if (route === "chat") {
+        if (request.method !== "POST") {
+          return json({ error: "method_not_allowed", message: "/api/chat 只支持 POST" }, 405);
+        }
+        return handleChat(request, env);
+      }
       return json({ error: "not_found", message: `未知接口 /api/${route}` }, 404);
     } catch (error) {
       return json({ error: "internal_error", message: String(error?.message || error) }, 500);

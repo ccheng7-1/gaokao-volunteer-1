@@ -43,6 +43,8 @@ gaokao-platform/
 │  ├─ assets/
 │  │  ├─ core.js                # 共享核心逻辑：过滤/排序/分页/分数位次换算/冲稳保分档
 │  │  ├─ app.js                 # 页面逻辑 + 接口客户端（含无后端时的本地降级）
+│  │  ├─ assistant-core.mjs     # AI 助手共享内核：系统提示词 / 本地规则引擎 / LLM 工具调用
+│  │  ├─ assistant.js           # AI 助手前端挂件（悬浮按钮 + 聊天面板，含浏览器降级）
 │  │  └─ styles.css             # 移动优先样式
 │  └─ data/                     # 前端直接读的数据（真数据按年份懒加载）
 │     ├─ admission-<省>-<年>.json  # 录取记录，如 admission-zhejiang-2025.json
@@ -92,9 +94,39 @@ GET /api/query?province=江苏&year=2024&subject=物理类&batch=本科批
               &university=苏州&major=计算机&sort=rank&page=1&pageSize=20
 GET /api/recommend?province=江苏&year=2024&subject=物理类&batch=本科批
               &score=600   或   &rank=30000
+POST /api/chat        AI 助手问答，请求体 {"messages":[{"role":"user","content":"620分能上什么学校？"}]}
 ```
 
 关键字段：`score`（分数）与 `rank`（位次）二选一；给分数时会用该省一分一段表换算成位次再分档。
+
+## AI 助手
+
+每个页面右下角都有一个悬浮的 AI 助手 🤖，负责回应考生和家长的疑问：平台怎么用、冲稳保/位次等概念解释，
+也可以直接问「620 分能上什么学校」「浙江大学的计算机专业多少分」，助手会**实时查库**再作答，不编造分数线。
+
+三种运行模式，逐级降级，零配置也能用：
+
+| 模式 | 触发条件 | 说明 |
+| --- | --- | --- |
+| LLM 模式 | 服务端配置了 `CHAT_API_KEY` | OpenAI 兼容接口 + 工具调用（`query_admissions` / `get_recommend`），理解上下文、回答自然 |
+| 本地规则模式 | 服务端没配 Key | 内置意图识别 + 查库 + 模板作答，本地服务和 Worker 都支持 |
+| 浏览器降级 | 纯静态托管（如 GitHub Pages），`/api/chat` 不可达 | 前端直接读 `data/*.json` 在浏览器里完成问答 |
+
+接入大模型（OpenAI / DeepSeek / 通义 / Kimi 等 OpenAI 兼容接口均可）：
+
+```bash
+# 本地 dev-server：环境变量
+export CHAT_API_KEY=sk-xxx
+export CHAT_BASE_URL=https://api.deepseek.com/v1   # 可选，默认 https://api.openai.com/v1
+export CHAT_MODEL=deepseek-chat                     # 可选，默认 gpt-4o-mini
+
+# Cloudflare Worker：secret + 变量
+npx wrangler secret put CHAT_API_KEY
+npx wrangler deploy   # CHAT_BASE_URL / CHAT_MODEL 可加进 wrangler.toml 的 [vars]
+```
+
+共享内核在 `public/assets/assistant-core.mjs`（系统提示词、本地规则引擎、LLM 工具调用循环），
+前端挂件在 `public/assets/assistant.js`，改 FAQ 话术 / 分档口径只动这两个文件。
 
 ## 数据结构
 
